@@ -9,6 +9,7 @@ import datetime
 import json
 import os
 import signal
+import time
 from playwright.sync_api import sync_playwright
 
 DETAIL_URL = "https://csqaq.com/goods/{goods_id}"
@@ -16,6 +17,10 @@ RESULT_FILE = "result.json"
 
 CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "5"))
 SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
+
+# API URL 模式（用于智能等待关键 API 返回）
+API_CHART_ALL = "info/simple/chartAll"
+API_CHIP_DATA = "info/chipData"
 
 
 class TimeoutException(Exception):
@@ -33,6 +38,26 @@ def wait_network_idle(page, timeout=15000):
     except Exception:
         # networkidle 超时，回退到短等待
         page.wait_for_timeout(2000)
+
+
+def get_api_count(all_api_data, url_pattern):
+    """获取特定 API 的响应总数"""
+    return sum(len(all_api_data[u]) for u in all_api_data if url_pattern in u)
+
+
+def wait_for_new_response(all_api_data, url_pattern, before_count, timeout=15):
+    """等待特定 API 出现新响应（通过响应计数）
+
+    networkidle 可能提前结束（500ms 无请求），但 API 可能还没返回。
+    此函数确保关键 API 的新响应已到达，避免数据丢失。
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        current_count = get_api_count(all_api_data, url_pattern)
+        if current_count > before_count:
+            return True
+        time.sleep(0.3)
+    return False
 
 
 def scrape_one(page, goods_id, item_name=None):
@@ -163,8 +188,8 @@ def scrape_one(page, goods_id, item_name=None):
                     all_chart_daily.extend(arr)
                     print(f"      初始日线: {len(arr)} 条", flush=True)
 
-        # 6. 翻页（每次等待网络空闲）
-        print(f"  [6] 翻页（等待网络空闲）...", flush=True)
+        # 6. 翻页（每次等待网络空闲 + API 新响应）
+        print(f"  [6] 翻页（等待网络空闲 + chartAll API 新响应）...", flush=True)
         canvas_info = page.evaluate("""() => {
             const canvas = document.querySelector('canvas');
             if (!canvas) return null;
@@ -178,15 +203,18 @@ def scrape_one(page, goods_id, item_name=None):
 
             for i in range(CHART_SCROLL_TIMES):
                 before_total = len(all_chart_daily)
-                before_resp_count = len(all_api_data.get(chart_url, []))
+                before_resp_count = len(all_api_data.get(chart_url, [])) if chart_url else 0
 
                 page.mouse.move(canvas_info["x"] + canvas_info["width"] / 2, center_y)
                 for _ in range(5):
                     page.mouse.wheel(-1500, 0)
                     page.wait_for_timeout(300)
 
-                # 等待网络空闲（翻页后的 API 请求）
+                # 等待网络空闲 + chartAll API 新响应（双重保障）
                 wait_network_idle(page, timeout=8000)
+                if not wait_for_new_response(all_api_data, API_CHART_ALL, before_resp_count, timeout=8):
+                    # API 没有新响应，短等待
+                    page.wait_for_timeout(1000)
 
                 current_resp_count = len(all_api_data.get(chart_url, []))
                 if current_resp_count > before_resp_count:
@@ -219,8 +247,9 @@ def scrape_one(page, goods_id, item_name=None):
         item_result["chart_daily"] = all_chart_daily
         print(f"      ✓ 日线总计: {len(all_chart_daily)} 条", flush=True)
 
-        # 7. 切换 1 小时 + 等待网络空闲
-        print(f"  [7] 切换 1 小时（等待网络空闲）...", flush=True)
+        # 7. 切换 1 小时 + 等待网络空闲 + chartAll API 新响应
+        print(f"  [7] 切换 1 小时（等待网络空闲 + chartAll API 新响应）...", flush=True)
+        before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
         page.evaluate("""() => {
             const targets = ['1小时', '1H', '1h'];
             const els = document.querySelectorAll('span, div, a, button, li');
@@ -232,6 +261,10 @@ def scrape_one(page, goods_id, item_name=None):
             return false;
         }""")
         wait_network_idle(page)
+        # 关键修复：确保 chartAll API 新响应已到达（networkidle 可能提前结束）
+        if not wait_for_new_response(all_api_data, API_CHART_ALL, before_chart_count, timeout=15):
+            print(f"      chartAll API 超时，回退等待", flush=True)
+            page.wait_for_timeout(3000)
 
         if chart_url in all_api_data and all_api_data[chart_url]:
             latest_idx = len(all_api_data[chart_url]) - 1
@@ -244,8 +277,9 @@ def scrape_one(page, goods_id, item_name=None):
 
         item_result["chart_1h"] = all_chart_1h
 
-        # 8. 筹码分布 + 等待网络空闲
-        print(f"  [8] 点击筹码分布图（等待网络空闲）...", flush=True)
+        # 8. 筹码分布 + 等待网络空闲 + chipData API 新响应
+        print(f"  [8] 点击筹码分布图（等待网络空闲 + chipData API 新响应）...", flush=True)
+        before_chip_count = get_api_count(all_api_data, API_CHIP_DATA)
         page.evaluate("""() => {
             const chipEl = document.querySelector('.chip_tag___2aXfK');
             if (chipEl) { chipEl.click(); return 'class'; }
@@ -259,9 +293,9 @@ def scrape_one(page, goods_id, item_name=None):
             return false;
         }""")
         wait_network_idle(page, timeout=10000)
-
-        if chip_url not in all_api_data:
-            # 重试点击
+        # 关键修复：确保 chipData API 新响应已到达（networkidle 可能提前结束）
+        if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=15):
+            # 超时，重试点击
             page.evaluate("""() => {
                 const els = document.querySelectorAll('*');
                 for (const el of els) {
@@ -273,6 +307,9 @@ def scrape_one(page, goods_id, item_name=None):
                 return false;
             }""")
             wait_network_idle(page, timeout=10000)
+            if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=10):
+                print(f"      chipData API 超时", flush=True)
+                page.wait_for_timeout(3000)
 
         if chip_url in all_api_data and all_api_data[chip_url]:
             last_resp = all_api_data[chip_url][-1]
