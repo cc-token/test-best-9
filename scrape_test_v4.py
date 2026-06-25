@@ -8,7 +8,6 @@ import argparse
 import datetime
 import json
 import os
-import signal
 import time
 from playwright.sync_api import sync_playwright
 
@@ -21,14 +20,6 @@ SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
 # API URL 模式（用于智能等待关键 API 返回）
 API_CHART_ALL = "info/simple/chartAll"
 API_CHIP_DATA = "info/chipData"
-
-
-class TimeoutException(Exception):
-    pass
-
-
-def timeout_handler(signum, frame):
-    raise TimeoutException("单饰品抓取超时")
 
 
 def wait_network_idle(page, timeout=15000):
@@ -337,17 +328,12 @@ def scrape_one(page, goods_id, item_name=None):
 
 
 def scrape_with_retry(page, goods_id, item_name=None, max_retries=None):
-    """带重试的抓取"""
+    """带重试的抓取（移除 signal.alarm，避免破坏 Playwright 事件循环）"""
     if max_retries is None:
         max_retries = int(os.environ.get("MAX_RETRIES", "1"))
     for attempt in range(max_retries + 1):
         try:
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(SINGLE_ITEM_TIMEOUT)
-
             result = scrape_one(page, goods_id, item_name)
-
-            signal.alarm(0)
 
             if result["scrape_ok"]:
                 return result
@@ -357,14 +343,7 @@ def scrape_with_retry(page, goods_id, item_name=None, max_retries=None):
             else:
                 print(f"  [失败] 重试次数已用完", flush=True)
 
-        except TimeoutException:
-            signal.alarm(0)
-            if attempt < max_retries:
-                print(f"  [超时重试] 第 {attempt+1} 次超时，重试中...", flush=True)
-            else:
-                print(f"  [失败] 超时重试次数已用完", flush=True)
         except Exception as e:
-            signal.alarm(0)
             if attempt < max_retries:
                 print(f"  [异常重试] {type(e).__name__}，重试中...", flush=True)
             else:
@@ -429,7 +408,28 @@ def main():
                 print(f"  进度: {idx+1}/{len(items)} - {item.get('name', 'N/A')}", flush=True)
                 print(f"{'#'*60}", flush=True)
 
-                result = scrape_with_retry(page, item["goods_id"], item.get("name"))
+                try:
+                    result = scrape_with_retry(page, item["goods_id"], item.get("name"))
+                except Exception as e:
+                    # Playwright 事件循环损坏，重新创建 page
+                    print(f"  [FATAL] {type(e).__name__}: {e}", flush=True)
+                    print(f"  [恢复] 重新创建 page...", flush=True)
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    page = context.new_page()
+                    result = {
+                        "name": item.get("name", ""),
+                        "goods_id": str(item["goods_id"]),
+                        "detail": None,
+                        "chart_daily": [],
+                        "chart_1h": [],
+                        "chip_data": None,
+                        "scrape_ok": False,
+                        "scrape_fail": f"事件循环损坏: {type(e).__name__}",
+                    }
+
                 results.append(result)
 
                 name = result["name"] or "N/A"
