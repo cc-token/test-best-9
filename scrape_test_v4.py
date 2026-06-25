@@ -288,9 +288,9 @@ def scrape_one(page, goods_id, item_name=None):
 
             # 等待 chipData API 新响应（15 秒超时）
             if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=15):
-                # API 没返回，检测页面是否卡死
+                # API 没返回，检测页面是否卡死（用 wait_for_function 替代 evaluate）
                 try:
-                    page.evaluate("1+1", timeout=5000)
+                    page.wait_for_function("() => true", timeout=5000)
                     # 页面正常，但 API 没返回，跳过筹码分布
                     print(f"      chipData API 未响应，跳过筹码分布", flush=True)
                 except Exception:
@@ -412,7 +412,7 @@ def main():
 
                     # 检测页面是否仍然响应（防止 JS 卡死后继续操作）
                     try:
-                        page.evaluate("1+1", timeout=5000)
+                        page.wait_for_function("() => true", timeout=5000)
                     except Exception:
                         print(f"  [页面无响应] 重新创建 page...", flush=True)
                         try:
