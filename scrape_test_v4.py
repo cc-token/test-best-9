@@ -285,20 +285,22 @@ def scrape_one(page, goods_id, item_name=None):
                 return false;
             }""")
 
-            # 等待筹码分布数据加载（固定等待 5 秒，让 API 请求发出）
-            page.wait_for_timeout(5000)
+            # 轮询等待 chipData API 响应（最多 15 秒）
+            chip_found = False
+            chip_start = time.time()
+            while time.time() - chip_start < 15:
+                if chip_url in all_api_data and all_api_data[chip_url]:
+                    last_resp = all_api_data[chip_url][-1]
+                    parsed = json.loads(last_resp["body"])
+                    if parsed.get("code") == 200 and parsed.get("data"):
+                        chip_full_data = parsed["data"]
+                        item_result["chip_data"] = chip_full_data
+                        print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+                        chip_found = True
+                        break
+                time.sleep(0.5)
 
-            # 检查是否有 chipData API 响应
-            if chip_url in all_api_data and all_api_data[chip_url]:
-                last_resp = all_api_data[chip_url][-1]
-                parsed = json.loads(last_resp["body"])
-                if parsed.get("code") == 200 and parsed.get("data"):
-                    chip_full_data = parsed["data"]
-                    item_result["chip_data"] = chip_full_data
-                    print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
-                else:
-                    print(f"      chipData API 无数据", flush=True)
-            else:
+            if not chip_found:
                 # 没有 chipData 响应，检测页面是否卡死
                 try:
                     page.wait_for_function("() => true", timeout=5000)
