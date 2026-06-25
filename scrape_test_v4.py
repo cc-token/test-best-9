@@ -268,47 +268,45 @@ def scrape_one(page, goods_id, item_name=None):
 
         item_result["chart_1h"] = all_chart_1h
 
-        # 8. 筹码分布 + 等待网络空闲 + chipData API 新响应
-        print(f"  [8] 点击筹码分布图（等待网络空闲 + chipData API 新响应）...", flush=True)
+        # 8. 筹码分布 + 独立超时（某些饰品筹码分布会卡死页面）
+        print(f"  [8] 点击筹码分布图（独立超时 20s）...", flush=True)
         before_chip_count = get_api_count(all_api_data, API_CHIP_DATA)
-        page.evaluate("""() => {
-            const chipEl = document.querySelector('.chip_tag___2aXfK');
-            if (chipEl) { chipEl.click(); return 'class'; }
-            const els = document.querySelectorAll('span, div, a, button, li, p');
-            for (const el of els) {
-                const text = el.textContent.trim();
-                if ((text === '筹码分布图' || text === '筹码分布' || text === '筹码') && el.offsetParent !== null) {
-                    el.click(); return 'text:' + text;
-                }
-            }
-            return false;
-        }""")
-        wait_network_idle(page, timeout=10000)
-        # 关键修复：确保 chipData API 新响应已到达（networkidle 可能提前结束）
-        if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=15):
-            # 超时，重试点击
+        try:
+            # 设置较短超时，避免页面卡死
+            page.set_default_timeout(20000)
+
             page.evaluate("""() => {
-                const els = document.querySelectorAll('*');
+                const chipEl = document.querySelector('.chip_tag___2aXfK');
+                if (chipEl) { chipEl.click(); return 'class'; }
+                const els = document.querySelectorAll('span, div, a, button, li, p');
                 for (const el of els) {
                     const text = el.textContent.trim();
-                    if (text.includes('筹码') && text.length < 20 && el.offsetParent !== null && el.children.length === 0) {
-                        el.click(); return text;
+                    if ((text === '筹码分布图' || text === '筹码分布' || text === '筹码') && el.offsetParent !== null) {
+                        el.click(); return 'text:' + text;
                     }
                 }
                 return false;
             }""")
             wait_network_idle(page, timeout=10000)
-            if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=10):
-                print(f"      chipData API 超时", flush=True)
-                page.wait_for_timeout(3000)
 
-        if chip_url in all_api_data and all_api_data[chip_url]:
-            last_resp = all_api_data[chip_url][-1]
-            parsed = json.loads(last_resp["body"])
-            if parsed.get("code") == 200 and parsed.get("data"):
-                chip_full_data = parsed["data"]
-                item_result["chip_data"] = chip_full_data
-                print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+            # 等待 chipData API 新响应（15 秒超时）
+            if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=15):
+                print(f"      chipData API 超时，跳过筹码分布", flush=True)
+            else:
+                if chip_url in all_api_data and all_api_data[chip_url]:
+                    last_resp = all_api_data[chip_url][-1]
+                    parsed = json.loads(last_resp["body"])
+                    if parsed.get("code") == 200 and parsed.get("data"):
+                        chip_full_data = parsed["data"]
+                        item_result["chip_data"] = chip_full_data
+                        print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+
+        except Exception as e:
+            print(f"      [筹码分布超时] {type(e).__name__}: {e}，跳过", flush=True)
+            item_result["scrape_fail"] = f"筹码分布卡死: {type(e).__name__}"
+        finally:
+            # 恢复默认超时
+            page.set_default_timeout(30000)
 
         # 标记成功
         if item_result["detail"]:
@@ -316,9 +314,6 @@ def scrape_one(page, goods_id, item_name=None):
         else:
             item_result["scrape_fail"] = "无基本信息"
 
-    except TimeoutException as e:
-        item_result["scrape_fail"] = f"超时: {e}"
-        print(f"  [TIMEOUT] {e}", flush=True)
     except Exception as e:
         item_result["scrape_fail"] = f"{type(e).__name__}: {e}"
         print(f"  [ERROR] {type(e).__name__}: {e}", flush=True)
@@ -402,6 +397,7 @@ def main():
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = context.new_page()
+            page.set_default_timeout(30000)  # 默认 30 秒超时
 
             for idx, item in enumerate(items):
                 print(f"\n{'#'*60}", flush=True)
@@ -410,6 +406,19 @@ def main():
 
                 try:
                     result = scrape_with_retry(page, item["goods_id"], item.get("name"))
+
+                    # 检测页面是否仍然响应（防止 JS 卡死后继续操作）
+                    try:
+                        page.evaluate("1+1", timeout=5000)
+                    except Exception:
+                        print(f"  [页面无响应] 重新创建 page...", flush=True)
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        page = context.new_page()
+                        page.set_default_timeout(30000)
+
                 except Exception as e:
                     # Playwright 事件循环损坏，重新创建 page
                     print(f"  [FATAL] {type(e).__name__}: {e}", flush=True)
@@ -419,6 +428,7 @@ def main():
                     except Exception:
                         pass
                     page = context.new_page()
+                    page.set_default_timeout(30000)
                     result = {
                         "name": item.get("name", ""),
                         "goods_id": str(item["goods_id"]),
