@@ -268,13 +268,28 @@ def scrape_one(page, goods_id, item_name=None):
 
         item_result["chart_1h"] = all_chart_1h
 
-        # 8. 筹码分布 + 独立超时（某些饰品筹码分布会卡死页面）
+        # 8. 筹码分布（V5：优先点击 BUTTON + 不二次点击 + 40 秒超时）
         print(f"  [8] 点击筹码分布图...", flush=True)
         try:
-            # 点击操作用默认超时
-            page.evaluate("""() => {
+            # 点击前等待 1 秒（确保 JS 加载）
+            page.wait_for_timeout(1000)
+
+            # 优先点击 BUTTON 元素（.chip_tag___2aXfK 是 SPAN，点击它不触发 API）
+            click_result = page.evaluate("""() => {
+                // 1. 优先点击包含"筹码分布图"文本的 BUTTON
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = btn.textContent.trim();
+                    if (text === '筹码分布图' || text === '筹码分布') {
+                        btn.click(); return 'button:' + text;
+                    }
+                }
+                // 2. 点击 .chip_tag___2aXfK 的父元素（BUTTON）
                 const chipEl = document.querySelector('.chip_tag___2aXfK');
-                if (chipEl) { chipEl.click(); return 'class'; }
+                if (chipEl && chipEl.parentElement) {
+                    chipEl.parentElement.click(); return 'parent';
+                }
+                // 3. 文本匹配兜底
                 const els = document.querySelectorAll('span, div, a, button, li, p');
                 for (const el of els) {
                     const text = el.textContent.trim();
@@ -284,34 +299,34 @@ def scrape_one(page, goods_id, item_name=None):
                 }
                 return false;
             }""")
+            print(f"      点击返回: {click_result}", flush=True)
 
-            # 轮询等待 chipData API 响应（最多 15 秒）
+            # 轮询等待 chipData API 响应（最多 40 秒，摩托手套需要 12-34 秒）
+            # 不二次点击（二次点击会取消第一次的 API 请求）
+            # 用 page.wait_for_timeout() 等待（不阻塞事件循环）
             chip_found = False
             chip_start = time.time()
-            while time.time() - chip_start < 15:
-                # 用模式匹配查找 chipData 响应（URL 可能包含查询参数）
+            while time.time() - chip_start < 40:
                 for url in all_api_data:
                     if API_CHIP_DATA in url and all_api_data[url]:
                         last_resp = all_api_data[url][-1]
-                        parsed = json.loads(last_resp["body"])
-                        if parsed.get("code") == 200 and parsed.get("data"):
-                            chip_full_data = parsed["data"]
-                            item_result["chip_data"] = chip_full_data
-                            print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
-                            chip_found = True
-                            break
+                        try:
+                            parsed = json.loads(last_resp["body"])
+                            if parsed.get("code") == 200 and parsed.get("data"):
+                                chip_full_data = parsed["data"]
+                                item_result["chip_data"] = chip_full_data
+                                print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+                                chip_found = True
+                                break
+                        except Exception:
+                            pass
                 if chip_found:
                     break
-                time.sleep(0.5)
+                page.wait_for_timeout(500)
 
+            elapsed = time.time() - chip_start
             if not chip_found:
-                # 没有 chipData 响应，检测页面是否卡死
-                try:
-                    page.wait_for_function("() => true", timeout=5000)
-                    print(f"      chipData API 无响应，跳过筹码分布", flush=True)
-                except Exception:
-                    print(f"      [页面卡死] 跳过筹码分布", flush=True)
-                    item_result["scrape_fail"] = "筹码分布页面卡死"
+                print(f"      chipData API 无响应（{elapsed:.1f}s），跳过", flush=True)
 
         except Exception as e:
             print(f"      [筹码分布异常] {type(e).__name__}: {e}，跳过", flush=True)
