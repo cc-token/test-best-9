@@ -36,18 +36,21 @@ def get_api_count(all_api_data, url_pattern):
     return sum(len(all_api_data[u]) for u in all_api_data if url_pattern in u)
 
 
-def wait_for_new_response(all_api_data, url_pattern, before_count, timeout=15):
+def wait_for_new_response(page, all_api_data, url_pattern, before_count, timeout=15):
     """等待特定 API 出现新响应（通过响应计数）
 
     networkidle 可能提前结束（500ms 无请求），但 API 可能还没返回。
     此函数确保关键 API 的新响应已到达，避免数据丢失。
+
+    V11 修复：用 page.wait_for_timeout 替代 time.sleep，避免阻塞 Playwright 事件循环
+    （time.sleep 会阻塞事件循环，导致 page.on("response") 回调不触发，all_api_data 不更新）
     """
     start = time.time()
     while time.time() - start < timeout:
         current_count = get_api_count(all_api_data, url_pattern)
         if current_count > before_count:
             return True
-        time.sleep(0.3)
+        page.wait_for_timeout(300)
     return False
 
 
@@ -203,7 +206,7 @@ def scrape_one(page, goods_id, item_name=None):
 
                 # 等待网络空闲 + chartAll API 新响应（双重保障）
                 wait_network_idle(page, timeout=8000)
-                if not wait_for_new_response(all_api_data, API_CHART_ALL, before_resp_count, timeout=8):
+                if not wait_for_new_response(page, all_api_data, API_CHART_ALL, before_resp_count, timeout=8):
                     # API 没有新响应，短等待
                     page.wait_for_timeout(1000)
 
@@ -238,8 +241,24 @@ def scrape_one(page, goods_id, item_name=None):
         item_result["chart_daily"] = all_chart_daily
         print(f"      ✓ 日线总计: {len(all_chart_daily)} 条", flush=True)
 
-        # 7. 切换 1 小时 + 等待网络空闲 + chartAll API 新响应
-        print(f"  [7] 切换 1 小时（等待网络空闲 + chartAll API 新响应）...", flush=True)
+        # 7. 切换 1 小时（V11：V10 为主 + V9 补救）
+        # V10：翻页后等待 3s + 重新激活日线 + 切换 1h（成功时 1h=346）
+        # V9 补救：V10 失败时重新加载页面，先 1h（1h=150）
+        print(f"  [7] 切换 1 小时（V11：V10 为主 + V9 补救）...", flush=True)
+
+        # V10 方式：等待 3s 让页面状态稳定
+        page.wait_for_timeout(3000)
+        # 重新点击日线按钮（激活日线状态，翻页后页面 JS 状态可能损坏）
+        page.evaluate("""() => {
+            const els = document.querySelectorAll('span, div, a, button');
+            for (const el of els) {
+                if (el.textContent.trim() === '日线' && el.offsetParent !== null) { el.click(); return true; }
+            }
+            return false;
+        }""")
+        page.wait_for_timeout(1000)
+
+        # 切换 1h
         before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
         page.evaluate("""() => {
             const targets = ['1小时', '1H', '1h'];
@@ -251,20 +270,105 @@ def scrape_one(page, goods_id, item_name=None):
             }
             return false;
         }""")
-        wait_network_idle(page)
-        # 关键修复：确保 chartAll API 新响应已到达（networkidle 可能提前结束）
-        if not wait_for_new_response(all_api_data, API_CHART_ALL, before_chart_count, timeout=15):
-            print(f"      chartAll API 超时，回退等待", flush=True)
-            page.wait_for_timeout(3000)
 
-        if chart_url in all_api_data and all_api_data[chart_url]:
-            latest_idx = len(all_api_data[chart_url]) - 1
-            parsed = json.loads(all_api_data[chart_url][latest_idx]["body"])
-            if parsed.get("code") == 200:
-                arr = parsed.get("data", [])
-                if isinstance(arr, list):
-                    all_chart_1h.extend(arr)
-                    print(f"      ✓ 1 小时: {len(arr)} 条", flush=True)
+        # 轮询等待 chartAll API 新响应（V10：5s 超时，成功通常 0.5s）
+        v10_start = time.time()
+        v10_success = False
+        while time.time() - v10_start < 5:
+            current_count = get_api_count(all_api_data, API_CHART_ALL)
+            if current_count > before_chart_count:
+                v10_success = True
+                break
+            page.wait_for_timeout(500)
+
+        if v10_success:
+            # 等待数据完整
+            page.wait_for_timeout(2000)
+            if chart_url in all_api_data and all_api_data[chart_url]:
+                latest_idx = len(all_api_data[chart_url]) - 1
+                try:
+                    parsed = json.loads(all_api_data[chart_url][latest_idx]["body"])
+                    if parsed.get("code") == 200:
+                        arr = parsed.get("data", [])
+                        if isinstance(arr, list):
+                            all_chart_1h.extend(arr)
+                            print(f"      ✓ V10 成功 ({time.time()-v10_start:.1f}s): 1 小时 {len(arr)} 条", flush=True)
+                except Exception as e:
+                    print(f"      V10 解析失败: {e}", flush=True)
+        else:
+            # V9 补救：重新加载页面，先 1h（不翻页）
+            print(f"      V10 失败 ({time.time()-v10_start:.1f}s)，启用 V9 补救...", flush=True)
+            try:
+                page.goto(detail_url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                wait_network_idle(page)
+
+            # 点击 K 线图
+            page.evaluate("""() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    if (btn.textContent.trim() === 'K线图') { btn.click(); return true; }
+                }
+                return false;
+            }""")
+            wait_network_idle(page)
+
+            # 切换平台到悠悠有品
+            if select_info:
+                page.evaluate("""(targetValue) => {
+                    const selects = document.querySelectorAll('select');
+                    for (const sel of selects) {
+                        if (Array.from(sel.options).some(o => o.text === '悠悠有品')) {
+                            sel.value = targetValue;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            sel.dispatchEvent(new Event('input', {bubbles: true}));
+                            return true;
+                        }
+                    }
+                    return false;
+                }""", select_info["value"])
+                wait_network_idle(page)
+
+            # 切换日线（激活）
+            page.evaluate("""() => {
+                const els = document.querySelectorAll('span, div, a, button');
+                for (const el of els) {
+                    if (el.textContent.trim() === '日线' && el.offsetParent !== null) { el.click(); return true; }
+                }
+                return false;
+            }""")
+            wait_network_idle(page)
+
+            # 切换 1h
+            before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
+            page.evaluate("""() => {
+                const targets = ['1小时', '1H', '1h'];
+                const els = document.querySelectorAll('span, div, a, button, li');
+                for (const target of targets) {
+                    for (const el of els) {
+                        if (el.textContent.trim() === target && el.offsetParent !== null) { el.click(); return true; }
+                    }
+                }
+                return false;
+            }""")
+
+            # 轮询等待 chartAll API 新响应（V9：20s 超时）
+            if not wait_for_new_response(page, all_api_data, API_CHART_ALL, before_chart_count, timeout=20):
+                print(f"      V9 补救也失败", flush=True)
+            else:
+                page.wait_for_timeout(2000)
+                if chart_url in all_api_data and all_api_data[chart_url]:
+                    latest_idx = len(all_api_data[chart_url]) - 1
+                    try:
+                        parsed = json.loads(all_api_data[chart_url][latest_idx]["body"])
+                        if parsed.get("code") == 200:
+                            arr = parsed.get("data", [])
+                            if isinstance(arr, list):
+                                all_chart_1h.extend(arr)
+                                print(f"      ✓ V9 补救成功: 1 小时 {len(arr)} 条", flush=True)
+                    except Exception as e:
+                        print(f"      V9 解析失败: {e}", flush=True)
 
         item_result["chart_1h"] = all_chart_1h
 
