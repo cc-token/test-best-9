@@ -270,9 +270,8 @@ def scrape_one(page, goods_id, item_name=None):
 
         # 8. 筹码分布 + 独立超时（某些饰品筹码分布会卡死页面）
         print(f"  [8] 点击筹码分布图...", flush=True)
-        before_chip_count = get_api_count(all_api_data, API_CHIP_DATA)
         try:
-            # 点击操作用默认超时（30s），不限制
+            # 点击操作用默认超时
             page.evaluate("""() => {
                 const chipEl = document.querySelector('.chip_tag___2aXfK');
                 if (chipEl) { chipEl.click(); return 'class'; }
@@ -286,26 +285,27 @@ def scrape_one(page, goods_id, item_name=None):
                 return false;
             }""")
 
-            # 等待 chipData API 新响应（15 秒超时）
-            if not wait_for_new_response(all_api_data, API_CHIP_DATA, before_chip_count, timeout=15):
-                # API 没返回，检测页面是否卡死（用 wait_for_function 替代 evaluate）
+            # 等待筹码分布数据加载（固定等待 5 秒，让 API 请求发出）
+            page.wait_for_timeout(5000)
+
+            # 检查是否有 chipData API 响应
+            if chip_url in all_api_data and all_api_data[chip_url]:
+                last_resp = all_api_data[chip_url][-1]
+                parsed = json.loads(last_resp["body"])
+                if parsed.get("code") == 200 and parsed.get("data"):
+                    chip_full_data = parsed["data"]
+                    item_result["chip_data"] = chip_full_data
+                    print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+                else:
+                    print(f"      chipData API 无数据", flush=True)
+            else:
+                # 没有 chipData 响应，检测页面是否卡死
                 try:
                     page.wait_for_function("() => true", timeout=5000)
-                    # 页面正常，但 API 没返回，跳过筹码分布
-                    print(f"      chipData API 未响应，跳过筹码分布", flush=True)
+                    print(f"      chipData API 无响应，跳过筹码分布", flush=True)
                 except Exception:
-                    # 页面卡死，跳过并标记
                     print(f"      [页面卡死] 跳过筹码分布", flush=True)
                     item_result["scrape_fail"] = "筹码分布页面卡死"
-            else:
-                # API 返回了，解析数据
-                if chip_url in all_api_data and all_api_data[chip_url]:
-                    last_resp = all_api_data[chip_url][-1]
-                    parsed = json.loads(last_resp["body"])
-                    if parsed.get("code") == 200 and parsed.get("data"):
-                        chip_full_data = parsed["data"]
-                        item_result["chip_data"] = chip_full_data
-                        print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
 
         except Exception as e:
             print(f"      [筹码分布异常] {type(e).__name__}: {e}，跳过", flush=True)
