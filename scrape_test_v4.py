@@ -289,15 +289,19 @@ def scrape_one(page, goods_id, item_name=None):
             chip_found = False
             chip_start = time.time()
             while time.time() - chip_start < 15:
-                if chip_url in all_api_data and all_api_data[chip_url]:
-                    last_resp = all_api_data[chip_url][-1]
-                    parsed = json.loads(last_resp["body"])
-                    if parsed.get("code") == 200 and parsed.get("data"):
-                        chip_full_data = parsed["data"]
-                        item_result["chip_data"] = chip_full_data
-                        print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
-                        chip_found = True
-                        break
+                # 用模式匹配查找 chipData 响应（URL 可能包含查询参数）
+                for url in all_api_data:
+                    if API_CHIP_DATA in url and all_api_data[url]:
+                        last_resp = all_api_data[url][-1]
+                        parsed = json.loads(last_resp["body"])
+                        if parsed.get("code") == 200 and parsed.get("data"):
+                            chip_full_data = parsed["data"]
+                            item_result["chip_data"] = chip_full_data
+                            print(f"      ✓ 筹码分布: {len(chip_full_data.get('date', []))} 天", flush=True)
+                            chip_found = True
+                            break
+                if chip_found:
+                    break
                 time.sleep(0.5)
 
             if not chip_found:
